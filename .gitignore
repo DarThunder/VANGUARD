@@ -1,0 +1,5 @@
+.clangd
+gen_keys.c
+vanguard_ddrp
+*.bin
+*.key
