@@ -17,6 +17,8 @@ enum {
   DDRP_PKT_CHALLENGE = 0x02,
   DDRP_PKT_RESOLVE = 0x03,
   DDRP_PKT_ASSIGN = 0x04,
+  DDRP_PKT_PING = 0x05,
+  DDRP_PKT_PONG = 0x06,
   DDRP_PKT_REJECT = 0x0E
 };
 
@@ -56,6 +58,21 @@ typedef struct {
   uint16_t gateway_port;
   uint32_t lease_seconds;
 } ddrp_assign_t;
+
+typedef struct {
+  uint8_t pkt_type;
+  uint32_t coord_x;
+  uint32_t coord_y;
+  uint8_t client_pubkey[32];
+  uint32_t timestamp;
+  uint8_t hmac_proof[32];
+} ddrp_ping_t;
+
+typedef struct {
+  uint8_t pkt_type;
+  uint32_t coord_y;
+  uint32_t lease_seconds;
+} ddrp_pong_t;
 
 typedef struct {
   uint8_t pkt_type;
@@ -207,6 +224,48 @@ int main(int argc, char *argv[]) {
   printf("  * Gateway WG:       Puerto %u, PK: %s\n",
          ntohs(assign->gateway_port), b64_gw_pk);
   printf("  * Lease:            %u segundos\n", ntohl(assign->lease_seconds));
+
+  printf("[TERMUX-CLI] Iniciando bucle de Keepalive (intervalo: %u s)...\n",
+         ntohl(assign->lease_seconds) / 2);
+
+  uint32_t my_x = ntohl(assign->coord_x);
+  uint32_t my_y = ntohl(assign->coord_y);
+  uint32_t interval = ntohl(assign->lease_seconds) / 2;
+
+  while (1) {
+    sleep(interval);
+
+    uint32_t now_ts = (uint32_t)time(NULL);
+    ddrp_ping_t ren;
+    memset(&ren, 0, sizeof(ren));
+    ren.pkt_type = DDRP_PKT_PING;
+    ren.coord_x = htonl(my_x);
+    ren.coord_y = htonl(my_y);
+    ren.timestamp = htonl(now_ts);
+    memcpy(ren.client_pubkey, cli_wg_pk, 32);
+
+    uint8_t payload[8];
+    memcpy(payload, &ren.coord_y, 4);
+    memcpy(payload + 4, &ren.timestamp, 4);
+    crypto_auth_hmacsha256(ren.hmac_proof, payload, sizeof(payload),
+                           master_token);
+
+    sendto(sockfd, &ren, sizeof(ren), 0, (struct sockaddr *)&saddr,
+           sizeof(saddr));
+
+    n = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&saddr,
+                 &slen);
+    if (n > 0 && buffer[0] == DDRP_PKT_PONG) {
+      printf("[KEEPALIVE] Lease renovado correctamente con VANGUARD.\n");
+    } else if (n > 0 && buffer[0] == DDRP_PKT_REJECT) {
+      printf("[KEEPALIVE ALERTA] Renovación rechazada (sesión expirada o "
+             "inválida). Saliendo.\n");
+      break;
+    } else {
+      printf("[KEEPALIVE WARN] Sin respuesta de VANGUARD (reintentando en el "
+             "próximo ciclo)...\n");
+    }
+  }
 
   close(sockfd);
   return 0;

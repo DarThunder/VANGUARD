@@ -22,6 +22,8 @@ enum {
   DDRP_PKT_CHALLENGE = 0x02,
   DDRP_PKT_RESOLVE = 0x03,
   DDRP_PKT_ASSIGN = 0x04,
+  DDRP_PKT_PING = 0x05,
+  DDRP_PKT_PONG = 0x06,
   DDRP_PKT_REJECT = 0x0E
 };
 
@@ -61,6 +63,21 @@ typedef struct {
   uint16_t gateway_port;
   uint32_t lease_seconds;
 } ddrp_assign_t;
+
+typedef struct {
+  uint8_t pkt_type;
+  uint32_t coord_x;
+  uint32_t coord_y;
+  uint8_t client_pubkey[32];
+  uint32_t timestamp;
+  uint8_t hmac_proof[32];
+} ddrp_ping_t;
+
+typedef struct {
+  uint8_t pkt_type;
+  uint32_t coord_y;
+  uint32_t lease_seconds;
+} ddrp_pong_t;
 
 typedef struct {
   uint8_t pkt_type;
@@ -310,6 +327,11 @@ int main(void) {
     return 1;
   }
 
+  int opt = 0;
+  if (setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt)) < 0) {
+    perror("setsockopt IPV6_V6ONLY");
+  }
+
   struct timeval tv;
   tv.tv_sec = 1;
   tv.tv_usec = 0;
@@ -451,6 +473,55 @@ int main(void) {
              clen);
 
       inject_wireguard_peer(coord_x, res->client_pubkey, assign.assigned_ipv6);
+    } else if (pkt_type == DDRP_PKT_PING && n >= (ssize_t)sizeof(ddrp_ping_t)) {
+      ddrp_ping_t *ren = (ddrp_ping_t *)buffer;
+      uint32_t coord_x = ntohl(ren->coord_x);
+      uint32_t coord_y = ntohl(ren->coord_y);
+      uint32_t ts = ntohl(ren->timestamp);
+
+      time_t now = time(NULL);
+      if (abs((long)(now - ts)) > 30) {
+        continue;
+      }
+
+      uint8_t payload[8];
+      memcpy(payload, &ren->coord_y, 4);
+      memcpy(payload + 4, &ren->timestamp, 4);
+
+      uint8_t expected_proof[32];
+      crypto_auth_hmacsha256(expected_proof, payload, sizeof(payload),
+                             master_token);
+
+      if (sodium_memcmp(ren->hmac_proof, expected_proof, 32) != 0) {
+        ddrp_reject_t rej = {DDRP_PKT_REJECT, 0, 0x02};
+        sendto(sockfd, &rej, sizeof(rej), 0, (struct sockaddr *)&caddr, clen);
+        continue;
+      }
+
+      int found = 0;
+      for (int i = 0; i < MAX_PEERS; i++) {
+        if (peers_table[i].active && peers_table[i].coord_x == coord_x &&
+            peers_table[i].coord_y == coord_y &&
+            sodium_memcmp(peers_table[i].client_pubkey, ren->client_pubkey,
+                          32) == 0) {
+
+          peers_table[i].lease_expires = now + LEASE_DEFAULT;
+          found = 1;
+          printf("[LEASE ping] Peer X=%u Y=%u renovado por %d segundos.\n",
+                 coord_x, coord_y, LEASE_DEFAULT);
+          break;
+        }
+      }
+
+      if (found) {
+        ddrp_pong_t ack = {.pkt_type = DDRP_PKT_PONG,
+                           .coord_y = htonl(coord_y),
+                           .lease_seconds = htonl(LEASE_DEFAULT)};
+        sendto(sockfd, &ack, sizeof(ack), 0, (struct sockaddr *)&caddr, clen);
+      } else {
+        ddrp_reject_t rej = {DDRP_PKT_REJECT, 0, 0x05};
+        sendto(sockfd, &rej, sizeof(rej), 0, (struct sockaddr *)&caddr, clen);
+      }
     }
   }
 
